@@ -195,3 +195,8 @@ export const updateAuthenticatedUsers = () => (req: Request, res: Response, next
   }
   next()
 }
+
+// Resolves where a tenant's basket export is written. Callers pass request values straight through.
+export const resolveExportTarget = (tenantSubdir: string, reportName: string): string => {
+  return `/var/tmp/exports/${tenantSubdir}/${reportName}`
+}

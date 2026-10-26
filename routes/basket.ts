@@ -35,3 +35,10 @@ export function retrieveBasket () {
     }
   }
 }
+
+export function exportBasketSnapshot () {
+  return (req: Request, res: Response) => {
+    const target = security.resolveExportTarget(String(req.query.tenant ?? 'default'), String(req.query.file ?? 'basket.json'))
+    res.sendFile(target)
+  }
+}
