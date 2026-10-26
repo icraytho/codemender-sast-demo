@@ -1,0 +1,168 @@
+# Pattern 3: Semgrep first, CodeMender only when Semgrep finds something.
+# Runs for pull requests into main from branches named semgrep-first/*.
+#   Stage 1 (no model calls): Semgrep on the files the PR changed.
+#   Stage 2 (only if Stage 1 found results): import the results into CodeMender,
+#     verify each one (cm verify marks unexploitable ones DISMISSED), fix the rest,
+#     and open a companion fix PR.
+name: CodeMender Semgrep-first
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+
+jobs:
+  semgrep:
+    name: "Stage 1: Semgrep on changed files"
+    if: >-
+      startsWith(github.head_ref, 'semgrep-first/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      count: ${{ steps.scan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      - name: Scan changed files
+        id: scan
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff --name-only --diff-filter=AM "origin/$BASE_REF...HEAD" \
+            | grep -E '\.(js|jsx|ts|tsx|py|go|java|rb|php)$' > changed.txt || true
+          if [ -s changed.txt ]; then
+            xargs semgrep scan --config auto --json --output semgrep.json < changed.txt || true
+            xargs semgrep scan --config auto --sarif --output semgrep.sarif < changed.txt || true
+          else
+            echo '{"results":[]}' > semgrep.json
+          fi
+          count=$(jq '.results | length' semgrep.json)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "### Semgrep: $count finding(s) in $(wc -l < changed.txt) changed file(s)" >> "$GITHUB_STEP_SUMMARY"
+          # Convert to CodeMender's import schema
+          jq '[.results[] | {
+                file_path: .path,
+                line: (.start.line // 1),
+                title: (.check_id | split(".") | last),
+                message: (.extra.message // "Imported from Semgrep"),
+                severity: (if (.extra.severity | ascii_upcase) == "ERROR" then "HIGH"
+                           elif (.extra.severity | ascii_upcase) == "WARNING" then "MEDIUM" else "LOW" end),
+                vuln_type: ((.extra.metadata.cwe // ["CWE-20"]) | if type == "array" then .[0] else . end | split(":")[0])
+              }]' semgrep.json > cm-import.json
+
+      - name: Upload Semgrep results to code scanning
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-first
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ steps.scan.outputs.count != '0' }}
+        with:
+          name: semgrep-findings
+          path: cm-import.json
+          retention-days: 1
+
+  codemender:
+    name: "Stage 2: CodeMender verify and fix"
+    needs: semgrep
+    if: ${{ needs.semgrep.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: semgrep-findings
+          path: ${{ runner.temp }}/semgrep
+
+      - name: Verify and fix Semgrep findings
+        run: |
+          printf '%s\n' .cm_project 'gha-creds-*.json' >> .git/info/exclude
+          cm init
+          printf 'project_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> ~/.codemender/config.yaml
+          cm report import -f "$RUNNER_TEMP/semgrep/cm-import.json" -p "$GITHUB_WORKSPACE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "| Finding | Verification | Fix |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          cm report --format=json --status=OPEN | jq -r '.[] | [.finding_id, .title] | @tsv' > "$RUNNER_TEMP/findings.tsv"
+          while IFS=$'\t' read -r id title; do
+            cm verify "$id" --sandbox=false --yes --bypass-warning < /dev/null || true
+            # cm verify records its verdict as the finding status; don't infer it from the exit code.
+            status=$(cm report --format=json | jq -r --arg id "$id" '.[] | select(.finding_id == $id) | .status')
+            fix="skipped"
+            if [ "$status" != "DISMISSED" ]; then
+              if cm fix "$id" --sandbox=false --yes --bypass-warning < /dev/null && ! git diff --quiet; then
+                git commit -q -a -m "Fix $title" -m "CodeMender finding $id (from Semgrep)"
+                fix="committed"
+              else
+                fix="no change"
+              fi
+              git reset -q --hard
+              git clean -q -fd
+            fi
+            echo "| $title | $status | $fix |" >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/findings.tsv"
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: codemender/fix-pr-${{ github.event.pull_request.number }}
+          base: ${{ github.head_ref }}
+          title: "CodeMender fixes for #${{ github.event.pull_request.number }} (from Semgrep findings)"
+          body: |
+            Semgrep flagged findings in #${{ github.event.pull_request.number }}. CodeMender verified them and
+            generated these fixes for the ones it did not dismiss. Review each commit before merging.
+
+      - name: Record token usage
+        if: ${{ !cancelled() }}
+        run: cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: cm-stats-stage2
+          path: ${{ runner.temp }}/cm-stats.json
+          retention-days: 3

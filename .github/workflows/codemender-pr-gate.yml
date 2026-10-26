@@ -1,0 +1,192 @@
+# Pattern 1: CodeMender gate on pull requests into main (not on every push).
+# Based on the reference workflow in the CodeMender CI/CD documentation, plus:
+#   * --diff-depth=2 (callers and callees two hops out)
+#   * cm-stats-* artifacts so the demo UI can show the tokens each job used
+# Branches named semgrep-first/* are handled by codemender-semgrep-escalate.yml instead.
+name: CodeMender PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+
+jobs:
+  scan:
+    name: CodeMender scan
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'semgrep-first/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write         # Workload Identity Federation
+      security-events: write  # Upload SARIF to code scanning
+      actions: read
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - name: Scan the pull request (2-hop impact)
+        id: scan
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          FAIL_ON: CRITICAL,HIGH
+        run: |
+          cm --version
+          cm init
+          status=0
+          cm find . \
+            --diff="origin/$BASE_REF" \
+            --diff-depth=2 \
+            --diff-workers=16 \
+            --fail-on="$FAIL_ON" \
+            --format=sarif \
+            --output=codemender.sarif \
+            --sandbox=false \
+            --yes \
+            --bypass-warning || status=$?
+
+          cm report --format=md >> "$GITHUB_STEP_SUMMARY" || true
+
+          echo '[]' > "$RUNNER_TEMP/codemender-findings.json"
+          if [ "$status" -ne 0 ]; then
+            cm report --format=json --status=OPEN \
+              | jq --arg fail_on "$FAIL_ON" '
+                  ($fail_on | ascii_upcase | split(",")) as $severities
+                  | [.[]
+                     | select(.title | startswith("[LEGACY / UNTOUCHED]") | not)
+                     | select(.severity | ascii_upcase | IN($severities[]))]' \
+              > "$RUNNER_TEMP/codemender-findings.json"
+          fi
+          echo "findings=$(jq length "$RUNNER_TEMP/codemender-findings.json")" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('codemender.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: codemender.sarif
+          category: codemender
+
+      - name: Save findings for autofix
+        if: ${{ !cancelled() && steps.scan.outputs.findings > 0 }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender-findings.json
+          retention-days: 1
+
+      - name: Record token usage
+        if: ${{ !cancelled() }}
+        run: cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: cm-stats-scan
+          path: ${{ runner.temp }}/cm-stats.json
+          retention-days: 3
+
+  autofix:
+    name: CodeMender autofix
+    needs: scan
+    if: ${{ !cancelled() && needs.scan.outputs.findings > 0 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write        # Push the fix branch
+      pull-requests: write   # Open the fix pull request
+      id-token: write        # Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender
+
+      - name: Fix findings
+        run: |
+          printf '%s\n' .cm_project 'gha-creds-*.json' >> .git/info/exclude
+          cm init
+          printf 'project_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> ~/.codemender/config.yaml
+          cm report import -f "$RUNNER_TEMP/codemender/codemender-findings.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cm report --format=json --status=OPEN \
+            | jq -r '.[] | [.finding_id, .title] | @tsv' \
+            > "$RUNNER_TEMP/findings.tsv"
+          while IFS=$'\t' read -r id title; do
+            # cm fix exits 0 when it makes no edits, so also check for changes.
+            if cm fix "$id" --sandbox=false --yes --bypass-warning < /dev/null &&
+               ! git diff --quiet; then
+              git commit -q -a -m "Fix $title" -m "CodeMender finding $id"
+            else
+              echo "::warning::CodeMender didn't fix \"$title\" ($id)."
+            fi
+            git reset -q --hard
+            git clean -q -fd
+          done < "$RUNNER_TEMP/findings.tsv"
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: codemender/fix-pr-${{ github.event.pull_request.number }}
+          base: ${{ github.head_ref }}
+          title: "CodeMender fixes for #${{ github.event.pull_request.number }}"
+          body: |
+            CodeMender generated these fixes for findings in #${{ github.event.pull_request.number }}.
+            Review each commit before you merge this pull request into `${{ github.head_ref }}`.
+
+      - name: Record token usage
+        if: ${{ !cancelled() }}
+        run: cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: cm-stats-autofix
+          path: ${{ runner.temp }}/cm-stats.json
+          retention-days: 3

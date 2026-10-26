@@ -1,0 +1,45 @@
+# Semgrep on pull requests into main, side by side with the CodeMender PR gate.
+# Rules only, no model calls. Skipped for semgrep-first/* branches, which run
+# Semgrep as Stage 1 of codemender-semgrep-escalate.yml.
+name: Semgrep
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  semgrep:
+    name: Semgrep (new findings vs main)
+    if: ${{ !startsWith(github.head_ref, 'semgrep-first/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      - name: Scan changes against main
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          semgrep scan \
+            --config auto \
+            --baseline-commit "origin/$BASE_REF" \
+            --sarif --output semgrep.sarif || true
+
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
