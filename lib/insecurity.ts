@@ -4,6 +4,7 @@
  */
 
 import fs from 'node:fs'
+import path from 'node:path'
 import crypto from 'node:crypto'
 import { type Request, type Response, type NextFunction } from 'express'
 import { type UserModel } from '@juice-shop/models/user'
@@ -198,5 +199,37 @@ export const updateAuthenticatedUsers = () => (req: Request, res: Response, next
 
 // Resolves where a tenant's basket export is written. Callers pass request values straight through.
 export const resolveExportTarget = (tenantSubdir: string, reportName: string): string => {
-  return `/var/tmp/exports/${tenantSubdir}/${reportName}`
+  if (
+    typeof tenantSubdir !== 'string' ||
+    typeof reportName !== 'string' ||
+    tenantSubdir.trim() === '' ||
+    reportName.trim() === '' ||
+    tenantSubdir === '.' ||
+    reportName === '.' ||
+    tenantSubdir.includes('..') ||
+    reportName.includes('..') ||
+    tenantSubdir.includes('/') ||
+    tenantSubdir.includes('\\') ||
+    tenantSubdir.includes('\0') ||
+    reportName.includes('/') ||
+    reportName.includes('\\') ||
+    reportName.includes('\0')
+  ) {
+    throw new Error('Invalid export target path')
+  }
+
+  const safeTenant = sanitizeFilename(tenantSubdir)
+  const safeReport = sanitizeFilename(reportName)
+  const baseDir = path.resolve('/var/tmp/exports')
+  const tenantDir = path.resolve(baseDir, safeTenant)
+  const target = path.resolve(tenantDir, safeReport)
+
+  if (
+    !tenantDir.startsWith(baseDir + path.sep) ||
+    !target.startsWith(tenantDir + path.sep)
+  ) {
+    throw new Error('Invalid export target path')
+  }
+
+  return target
 }
