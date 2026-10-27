@@ -1,0 +1,43 @@
+# Semgrep on pushes to pr/** branches or pull requests into main, side by side with the CodeMender CI/CD Guardrail.
+# Rules only, no model calls.
+name: Semgrep
+
+on:
+  push:
+    branches: [ "pr/**" ]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  semgrep:
+    name: Semgrep (new findings vs main)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      - name: Scan changes against main
+        run: |
+          semgrep scan \
+            --config auto \
+            --baseline-commit "origin/main" \
+            --sarif --output semgrep.sarif || true
+
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep

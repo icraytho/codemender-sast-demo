@@ -1,0 +1,282 @@
+# =============================================================================
+# CodeMender CI/CD Security Guardrail Pipeline (2-Hop Diff + Verify + Autofix PR)
+# =============================================================================
+
+name: CodeMender CI/CD Guardrail
+
+# Trigger on pushes to main or pr/** demo branches, plus manual workflow_dispatch.
+# Documentation and gitignore changes are ignored so they do not burn CI time.
+on:
+  push:
+    branches: [ "main", "pr/**" ]
+    paths-ignore: [ '**.md', '.gitignore' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # push the remediation branch
+  pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # keyless WIF authentication
+  security-events: write   # upload SARIF to GitHub Code Scanning
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+  CM_MODEL: gemini-3.8-flash
+  CM_LIMIT: "1"
+
+jobs:
+  codemender-security:
+    name: Scan, Verify, and Patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cmbin"
+          chmod 0755 "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      - name: Initialize CodeMender Workspace
+        run: |
+          set -euo pipefail
+          printf '%s\n' '.codemender/' '.cm_project' '.exploit/' 'gha-creds-*.json' >> .git/info/exclude
+          cm init || true
+          CONFIG="$HOME/.codemender/config.yaml"
+          if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
+            printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+          fi
+          sed -i 's/type: ""/type: "git"/' "$CONFIG" 2>/dev/null || true
+          if ! grep -q 'type: "git"' "$CONFIG" 2>/dev/null && ! grep -q 'type: git' "$CONFIG" 2>/dev/null; then
+            printf '\nvcs:\n  type: git\n' >> "$CONFIG"
+          fi
+          python3 -c '
+          import yaml
+          with open("'"$CONFIG"'") as f:
+              cfg = yaml.safe_load(f) or {}
+          existing = cfg.setdefault("scan", {}).setdefault("exclude_dirs", [])
+          for d in ["node_modules", ".github", ".git", "docs", "frontend", "test", "data", "views"]:
+              if d not in existing:
+                  existing.append(d)
+          with open("'"$CONFIG"'", "w") as f:
+              yaml.safe_dump(cfg, f)
+          '
+          cat > "$HOME/.codemender/command_policy.yaml" << 'EOF'
+          block:
+            - sudo
+            - su
+            - mkfs
+            - dd
+            - reboot
+            - shutdown
+          block_patterns:
+            - '\bgit\s+(push|commit|rebase|reset\s+--hard)\b'
+          EOF
+          echo "Sandbox scoped to: $GITHUB_WORKSPACE"
+
+      - name: CodeMender Scan (2-Hop Diff Impact)
+        id: scan
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              echo "Baseline root snapshot commit on main; skipping diff scan."
+              exit 0
+            fi
+            DIFF_TARGET="HEAD~1"
+          else
+            DIFF_TARGET="origin/main"
+          fi
+          echo "Scanning 2-hop diff against $DIFF_TARGET using model $CM_MODEL..."
+          cm find . \
+            --diff="$DIFF_TARGET" \
+            --diff-depth=2 \
+            --diff-workers=16 \
+            -y --bypass-warning \
+            --model "$CM_MODEL" \
+            2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log" || true
+
+      - name: Export Security Report
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/cm-security-report.json"
+
+      - name: Triage Findings
+        id: triage
+        if: always()
+        run: |
+          python3 - "$RUNNER_TEMP/cm-security-report.json" << 'PY'
+          import json, os, sys
+          path = sys.argv[1]
+          try:
+              with open(path) as f:
+                  items = json.load(f)
+          except Exception:
+              items = []
+          rank = {"CRITICAL": 0, "HIGH": 1}
+          eligible = [
+              it for it in items
+              if isinstance(it, dict)
+              and not str(it.get("title", "")).startswith("[LEGACY / UNTOUCHED]")
+              and str(it.get("severity", "")).upper() in rank
+              and str(it.get("status", "OPEN")).upper() == "OPEN"
+          ]
+          eligible.sort(key=lambda x: rank.get(str(x.get("severity", "")).upper(), 99))
+          ids = [str(it.get("finding_id") or it.get("id")) for it in eligible if (it.get("finding_id") or it.get("id"))]
+          max_sev = str(eligible[0].get("severity", "NONE")).upper() if eligible else "NONE"
+          print(f"Triaged {len(items)} total finding(s) -> {len(ids)} HIGH/CRITICAL finding(s): {' '.join(ids)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"fix_ids={' '.join(ids)}\n")
+              out.write(f"max_severity={max_sev}\n")
+              out.write(f"high_critical={len(ids)}\n")
+          PY
+
+      - name: Verify and Remediate
+        id: remediate
+        if: steps.triage.outputs.fix_ids != ''
+        run: |
+          set -uo pipefail
+
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
+
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
+            COUNT=$((COUNT+1))
+
+            echo "::group::Verify $FID"
+            cm verify "$FID" -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
+            cm report -f json > "$RUNNER_TEMP/verified-$FID.json" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/verified-$FID.json"
+            echo "::endgroup::"
+
+            VERDICT=$(python3 -c '
+          import json, sys
+          items = json.load(open(sys.argv[1]))
+          fid = sys.argv[2]
+          st = next((str(i.get("status","OPEN")).upper() for i in items if str(i.get("finding_id") or i.get("id","")).startswith(fid)), "OPEN")
+          print(st)
+          ' "$RUNNER_TEMP/verified-$FID.json" "$FID")
+            echo "Finding $FID verification status: $VERDICT"
+            if [ "$VERDICT" = "DISMISSED" ]; then
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+
+            echo "::group::Fix $FID"
+            cm fix "$FID" -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            echo "::endgroup::"
+
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID"
+              FIXED=$((FIXED+1))
+              echo "Committed fix for $FID"
+            else
+              echo "cm produced no file changes for $FID"
+            fi
+          done
+
+          echo "Considered $COUNT finding(s): $FIXED fixed, $SKIPPED dismissed."
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          git --no-pager log --oneline -n 3 || true
+
+      - name: Open Remediation Pull Request
+        id: pr
+        if: steps.remediate.outputs.fixed != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: ${{ github.ref_name }}
+          branch: codemender/auto-remediation
+          delete-branch: true
+          commit-message: "fix(security): CodeMender autonomous remediation"
+          title: "CodeMender: autonomous security remediation (${{ github.ref_name }})"
+          body: |
+            Auto-remediated HIGH/CRITICAL findings via `cm verify` + `cm fix` (`${{ env.CM_MODEL }}`).
+            Review the commit diff before merging this pull request into `${{ github.ref_name }}`.
+
+      - name: Generate CodeMender HTML Report
+        if: always()
+        run: |
+          cm report -f html || true
+          if [ -f "$HOME/.codemender/reports/report.html" ]; then
+            cp "$HOME/.codemender/reports/report.html" "$RUNNER_TEMP/codemender-report.html"
+          fi
+
+      - name: Upload HTML Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-html-report
+          path: ${{ runner.temp }}/codemender-report.html
+          if-no-files-found: ignore
+
+      - name: Publish Security Report to Job Summary
+        if: always()
+        run: |
+          echo "## 🛡️ CodeMender Security Guardrail Report" >> "$GITHUB_STEP_SUMMARY"
+          cm report -f md -y >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Export SARIF Security Report
+        if: always()
+        run: |
+          cm report -f sarif -y > "$RUNNER_TEMP/codemender.sarif" || true
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles(format('{0}/codemender.sarif', runner.temp)) != ''
+        with:
+          sarif_file: ${{ runner.temp }}/codemender.sarif
+          category: codemender
+
+      - name: CodeMender Token Usage Stats
+        if: always()
+        run: |
+          cm stats </dev/null || true
+          cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - name: Upload Token Telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cm-stats-guardrail
+          path: ${{ runner.temp }}/cm-stats.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Security Gate
+        if: always()
+        run: |
+          FOUND="${{ steps.triage.outputs.high_critical }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          FOUND="${FOUND:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$FOUND" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $FOUND HIGH/CRITICAL finding(s). $PATCHED proposed for remediation in the pull request, $((FOUND-PATCHED)) not yet addressed. Failing the pipeline."
+            exit 1
+          fi

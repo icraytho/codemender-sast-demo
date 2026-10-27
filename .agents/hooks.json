@@ -1,0 +1,12 @@
+{
+  "semgrep-inner-loop-gate": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/agy_semgrep_stop_hook.sh",
+        "timeout": 15
+      }
+    ]
+  }
+}

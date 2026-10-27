@@ -1,0 +1,178 @@
+# =============================================================================
+# CodeMender Semgrep-First CI/CD Guardrail (Single-Job On-Push Pipeline)
+# =============================================================================
+
+name: CodeMender Semgrep-first
+
+on:
+  push:
+    branches: [ "semgrep-first/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # push the remediation branch
+  pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # keyless WIF authentication
+  security-events: write   # upload SARIF to GitHub Code Scanning
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+  CM_MODEL: gemini-3.8-flash
+  CM_LIMIT: "1"
+
+jobs:
+  semgrep-codemender-guardrail:
+    name: Semgrep Pre-Filter, Verify, and Patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      - name: Semgrep Scan on Changed Files (Pre-Filter)
+        id: semgrep
+        run: |
+          git diff --name-only --diff-filter=AM "origin/main...HEAD" \
+            | grep -E '\.(js|jsx|ts|tsx|py|go|java|rb|php|c|h)$' > "$RUNNER_TEMP/changed.txt" || true
+          if [ -s "$RUNNER_TEMP/changed.txt" ]; then
+            xargs semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep.json" < "$RUNNER_TEMP/changed.txt" || true
+            xargs semgrep scan --config auto --sarif --output "$RUNNER_TEMP/semgrep.sarif" < "$RUNNER_TEMP/changed.txt" || true
+          else
+            echo '{"results":[]}' > "$RUNNER_TEMP/semgrep.json"
+          fi
+          COUNT=$(jq '.results | length' "$RUNNER_TEMP/semgrep.json")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "### Semgrep Pre-Filter: $COUNT finding(s) in $(wc -l < "$RUNNER_TEMP/changed.txt") changed file(s)" >> "$GITHUB_STEP_SUMMARY"
+          jq '[.results[] | {
+                file_path: .path,
+                line: (.start.line // 1),
+                title: (.check_id | split(".") | last),
+                message: (.extra.message // "Imported from Semgrep"),
+                severity: (if (.extra.severity | ascii_upcase) == "ERROR" then "HIGH"
+                           elif (.extra.severity | ascii_upcase) == "WARNING" then "MEDIUM" else "LOW" end),
+                vuln_type: ((.extra.metadata.cwe // ["CWE-20"]) | if type == "array" then .[0] else . end | split(":")[0])
+              }]' "$RUNNER_TEMP/semgrep.json" > "$RUNNER_TEMP/cm-import.json"
+
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        if: steps.semgrep.outputs.count != '0'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Install CodeMender CLI (cm)
+        if: steps.semgrep.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cmbin"
+          chmod 0755 "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      - name: Initialize CodeMender & Import Semgrep Findings
+        if: steps.semgrep.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          printf '%s\n' '.codemender/' '.cm_project' '.exploit/' 'gha-creds-*.json' >> .git/info/exclude
+          cm init || true
+          CONFIG="$HOME/.codemender/config.yaml"
+          printf '\nproject_paths:\n  - "%s"\nvcs:\n  type: git\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+          cm report import -f "$RUNNER_TEMP/cm-import.json" -p "$GITHUB_WORKSPACE"
+
+      - name: Verify and Remediate Semgrep Findings
+        id: remediate
+        if: steps.semgrep.outputs.count != '0'
+        run: |
+          set -uo pipefail
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
+
+          IDS=$(cm report --format=json --status=OPEN | jq -r '.[].finding_id')
+          for FID in $IDS; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
+            COUNT=$((COUNT+1))
+
+            echo "::group::Verify $FID"
+            cm verify "$FID" -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
+            VERDICT=$(cm report -f json | jq -r --arg id "$FID" '.[] | select(.finding_id == $id) | .status')
+            echo "::endgroup::"
+
+            if [ "$VERDICT" = "DISMISSED" ]; then
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+
+            echo "::group::Fix $FID"
+            cm fix "$FID" -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            echo "::endgroup::"
+
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID (from Semgrep)"
+              FIXED=$((FIXED+1))
+            fi
+          done
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          echo "verified_open=$((COUNT-SKIPPED))" >> "$GITHUB_OUTPUT"
+
+      - name: Open Remediation Pull Request
+        if: steps.remediate.outputs.fixed != '' && steps.remediate.outputs.fixed != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: ${{ github.ref_name }}
+          branch: codemender/auto-remediation-${{ github.ref_name }}
+          delete-branch: true
+          commit-message: "fix(security): CodeMender autonomous remediation (from Semgrep)"
+          title: "CodeMender: autonomous remediation for Semgrep findings (${{ github.ref_name }})"
+          body: |
+            Semgrep flagged candidate findings on `${{ github.ref_name }}`. CodeMender verified exploitability and generated this remediation patch via `cm fix` (`${{ env.CM_MODEL }}`).
+
+      - name: Publish Security Report & Token Stats
+        if: always() && steps.semgrep.outputs.count != '0'
+        run: |
+          echo "## 🛡️ CodeMender Verification & Remediation Report" >> "$GITHUB_STEP_SUMMARY"
+          cm report -f md -y >> "$GITHUB_STEP_SUMMARY" || true
+          cm stats </dev/null || true
+          cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - name: Upload Token Telemetry
+        if: always() && steps.semgrep.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cm-stats-stage2
+          path: ${{ runner.temp }}/cm-stats.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Security Gate
+        if: always()
+        run: |
+          OPEN="${{ steps.remediate.outputs.verified_open }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          OPEN="${OPEN:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$OPEN" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender confirmed $OPEN exploitable Semgrep finding(s) ($PATCHED patched in remediation PR). Failing pipeline."
+            exit 1
+          fi
