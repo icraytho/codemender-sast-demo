@@ -1,0 +1,95 @@
+# Pattern 5: on-demand CodeMender scan of a pull request, triggered by a reviewer:
+#   * adding the `run-codemender` label, or
+#   * commenting `/codemender scan` (repository owners, members and collaborators only).
+#
+# Pattern 4 (crown-jewel paths) is the same job with a paths filter. To enable it,
+# add this under `pull_request:` and add `opened, synchronize` to `types`:
+#     paths: ['routes/login*', 'routes/payment*', 'lib/insecurity.ts', 'models/**']
+name: CodeMender on demand
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+
+jobs:
+  scan:
+    name: CodeMender on-demand scan
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'run-codemender' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/codemender scan') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the pull request head
+        env:
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          git fetch -q origin "pull/$PR/head:pr-$PR"
+          git checkout -q "pr-$PR"
+          echo "BASE_REF=$(git merge-base origin/main HEAD)" >> "$GITHUB_ENV"
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - name: Scan
+        run: |
+          cm init
+          status=0
+          cm find . --diff="$BASE_REF" --diff-depth=2 --fail-on=CRITICAL,HIGH \
+            --sandbox=false --yes --bypass-warning || status=$?
+          cm report --format=md > report.md || true
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Comment the report on the pull request
+        if: ${{ !cancelled() && hashFiles('report.md') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file report.md
+
+      - name: Record token usage
+        if: ${{ !cancelled() }}
+        run: cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: cm-stats-ondemand
+          path: ${{ runner.temp }}/cm-stats.json
+          retention-days: 3

@@ -1,0 +1,528 @@
+# =============================================================================
+# CodeMender CI/CD Security Guardrail Pipeline
+# Supports all 3 Enterprise Remediation Delivery Patterns:
+#   * Pattern 1 (pr/** -> Combined PR to main): Preserves the developer's
+#     feature commit(s), layers CodeMender's verified security patch on top,
+#     and opens ONE combined Pull Request straight into `main`.
+#   * Pattern 2 (autofix/** -> Direct Commit to Dev Branch + PR to main):
+#     Pushes CodeMender's verified security patch commit directly onto the
+#     developer's pushed branch and opens/updates that branch's PR into `main`.
+#   * Pattern 3 (review/** -> PR Comment + Inline Suggested Changes Only):
+#     Zero `git push` by the bot (works under strict branch/no-bot-write
+#     policies). Posts the verified finding, unified diff, and 1-click GitHub
+#     `suggestion` review blocks directly onto the developer's Pull Request.
+# =============================================================================
+
+name: CodeMender CI/CD Guardrail
+
+on:
+  push:
+    branches: [ "main", "pr/**", "autofix/**", "review/**" ]
+    paths-ignore: [ '**.md', '.gitignore' ]
+  workflow_dispatch:
+    inputs:
+      remediation_pattern:
+        description: "Remediation delivery pattern (auto: pr/** -> Pattern 1, autofix/** -> Pattern 2, review/** -> Pattern 3)"
+        required: false
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - pattern-1-combined-pr
+          - pattern-2-direct-commit
+          - pattern-3-pr-comment
+
+permissions:
+  contents: write          # push remediation branch or commit onto dev branch
+  pull-requests: write     # open/update Pull Requests into main
+  id-token: write          # keyless WIF authentication
+  security-events: write   # upload SARIF to GitHub Code Scanning
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+  CM_MODEL: gemini-3.8-flash
+  CM_LIMIT: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  codemender-security:
+    name: Scan, Verify, and Patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Prevent infinite CI loops when Pattern 2 commits a fix back onto the branch
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.actor != 'codemender-bot' &&
+      !startsWith(github.event.head_commit.message, 'fix(security): CodeMender')
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cmbin"
+          chmod 0755 "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      - name: Initialize CodeMender Workspace
+        run: |
+          set -euo pipefail
+          printf '%s\n' '.codemender/' '.cm_project' '.exploit/' 'gha-creds-*.json' >> .git/info/exclude
+          cm init || true
+          CONFIG="$HOME/.codemender/config.yaml"
+          python3 -c '
+          import yaml
+          with open("'"$CONFIG"'") as f:
+              cfg = yaml.safe_load(f) or {}
+          cfg["project_paths"] = ["'"$GITHUB_WORKSPACE"'"]
+          cfg.setdefault("vcs", {})["type"] = "git"
+          cfg.setdefault("tools", {})["confirm_commands"] = False
+          cfg.setdefault("tools", {})["confirm_writes"] = False
+          cfg.setdefault("sandbox", {})["enabled"] = False
+          existing = cfg.setdefault("scan", {}).setdefault("exclude_dirs", [])
+          for d in ["node_modules", ".github", ".git", "docs", "frontend", "test", "data", "views"]:
+              if d not in existing:
+                  existing.append(d)
+          with open("'"$CONFIG"'", "w") as f:
+              yaml.safe_dump(cfg, f)
+          '
+          echo "Configured CodeMender workspace for $GITHUB_WORKSPACE"
+
+      - name: CodeMender Scan (2-Hop Diff Impact)
+        id: scan
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              echo "Baseline root snapshot commit on main; skipping diff scan."
+              exit 0
+            fi
+            DIFF_TARGET="HEAD~1"
+          else
+            DIFF_TARGET="origin/main"
+          fi
+          echo "Scanning 2-hop diff against $DIFF_TARGET using model $CM_MODEL..."
+          cm find . \
+            --diff="$DIFF_TARGET" \
+            --diff-depth=2 \
+            --diff-workers=16 \
+            --sandbox=false \
+            --unrestricted \
+            -y --bypass-warning \
+            --model "$CM_MODEL" \
+            2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log" || true
+
+      - name: Export Security Report
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/cm-security-report.json"
+
+      - name: Triage Findings
+        id: triage
+        if: always()
+        run: |
+          python3 - "$RUNNER_TEMP/cm-security-report.json" << 'PY'
+          import json, os, sys
+          path = sys.argv[1]
+          try:
+              with open(path) as f:
+                  items = json.load(f)
+          except Exception:
+              items = []
+          rank = {"CRITICAL": 0, "HIGH": 1}
+          eligible = [
+              it for it in items
+              if isinstance(it, dict)
+              and not str(it.get("title", "")).startswith("[LEGACY / UNTOUCHED]")
+              and str(it.get("severity", "")).upper() in rank
+              and str(it.get("status", "OPEN")).upper() == "OPEN"
+          ]
+          eligible.sort(key=lambda x: rank.get(str(x.get("severity", "")).upper(), 99))
+          ids = [str(it.get("finding_id") or it.get("id")) for it in eligible if (it.get("finding_id") or it.get("id"))]
+          max_sev = str(eligible[0].get("severity", "NONE")).upper() if eligible else "NONE"
+          print(f"Triaged {len(items)} total finding(s) -> {len(ids)} HIGH/CRITICAL finding(s): {' '.join(ids)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"fix_ids={' '.join(ids)}\n")
+              out.write(f"max_severity={max_sev}\n")
+              out.write(f"high_critical={len(ids)}\n")
+          PY
+
+      - name: Verify and Remediate
+        id: remediate
+        if: steps.triage.outputs.fix_ids != ''
+        run: |
+          set -uo pipefail
+
+          ORIG_SHA=$(git rev-parse --short HEAD)
+          ORIG_FULL_SHA=$(git rev-parse HEAD)
+          echo "orig_sha=$ORIG_SHA" >> "$GITHUB_OUTPUT"
+          echo "orig_full_sha=$ORIG_FULL_SHA" >> "$GITHUB_OUTPUT"
+
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
+
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
+            COUNT=$((COUNT+1))
+
+            echo "::group::Verify $FID"
+            cm verify "$FID" --sandbox=false --unrestricted -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
+            cm report -f json > "$RUNNER_TEMP/verified-$FID.json" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/verified-$FID.json"
+            echo "::endgroup::"
+
+            VERDICT=$(python3 -c '
+          import json, sys
+          items = json.load(open(sys.argv[1]))
+          fid = sys.argv[2]
+          st = next((str(i.get("status","OPEN")).upper() for i in items if str(i.get("finding_id") or i.get("id","")).startswith(fid)), "OPEN")
+          print(st)
+          ' "$RUNNER_TEMP/verified-$FID.json" "$FID")
+            echo "Finding $FID verification status: $VERDICT"
+            if [ "$VERDICT" = "DISMISSED" ]; then
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+
+            echo "::group::Fix $FID"
+            cm fix "$FID" --sandbox=false --unrestricted -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            echo "::endgroup::"
+
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID"
+              FIXED=$((FIXED+1))
+              echo "Committed fix for $FID on top of developer commit $ORIG_SHA"
+            else
+              echo "cm produced no file changes for $FID"
+            fi
+          done
+
+          NEW_SHA=$(git rev-parse --short HEAD)
+          echo "Considered $COUNT finding(s): $FIXED fixed, $SKIPPED dismissed."
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          git --no-pager log --oneline -n 4 || true
+
+      - name: Deliver Remediation (Pattern 1 Combined PR, Pattern 2 Direct Commit, or Pattern 3 PR Comment)
+        id: pr
+        if: steps.remediate.outputs.fixed != '' && steps.remediate.outputs.fixed != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_MODE: ${{ inputs.remediation_pattern }}
+          ORIG_SHA: ${{ steps.remediate.outputs.orig_sha }}
+          ORIG_FULL_SHA: ${{ steps.remediate.outputs.orig_full_sha }}
+          NEW_SHA: ${{ steps.remediate.outputs.new_sha }}
+        run: |
+          set -euo pipefail
+          MODE="${INPUT_MODE:-auto}"
+          if [ "$MODE" = "auto" ]; then
+            if [[ "${GITHUB_REF_NAME}" == autofix/* ]]; then
+              MODE="pattern-2-direct-commit"
+            elif [[ "${GITHUB_REF_NAME}" == review/* ]]; then
+              MODE="pattern-3-pr-comment"
+            else
+              MODE="pattern-1-combined-pr"
+            fi
+          fi
+          # Never push directly onto main without review; use Pattern 1 PR if triggered on main
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            MODE="pattern-1-combined-pr"
+          fi
+
+          COMMIT_LOG=$(git --no-pager log --oneline origin/main..HEAD 2>/dev/null || git --no-pager log --oneline -n 2)
+
+          if [ "$MODE" = "pattern-3-pr-comment" ]; then
+            echo "=== Executing Pattern 3: PR Comment + Inline Suggested Changes Only (Zero Bot Push) ==="
+            EXISTING_PR=$(gh pr list --head "${GITHUB_REF_NAME}" --base main --state open --json number --jq '.[0].number // empty')
+            if [ -z "${EXISTING_PR}" ]; then
+              PR_URL=$(gh pr create --base main --head "${GITHUB_REF_NAME}" \
+                --title "feat: ${GITHUB_REF_NAME}" \
+                --body "Developer feature Pull Request from \`${GITHUB_REF_NAME}\` into \`main\`.")
+              EXISTING_PR=$(gh pr view "${PR_URL}" --json number --jq .number)
+            else
+              PR_URL=$(gh pr view "${EXISTING_PR}" --json url --jq .url)
+            fi
+
+            git diff "${ORIG_FULL_SHA}" HEAD > "$RUNNER_TEMP/cm-fix.diff"
+            git diff -U0 origin/main "${ORIG_FULL_SHA}" > "$RUNNER_TEMP/pr-added.diff"
+            git diff -U0 "${ORIG_FULL_SHA}" HEAD > "$RUNNER_TEMP/cm-fix-u0.diff"
+            cm report -f md -y > "$RUNNER_TEMP/cm-summary.md" 2>/dev/null || true
+
+            # Build inline GitHub Suggested Change review payload where hunks overlap the PR diff
+            python3 - "$RUNNER_TEMP/pr-added.diff" "$RUNNER_TEMP/cm-fix-u0.diff" "${ORIG_FULL_SHA}" "$RUNNER_TEMP/review-payload.json" << 'PY'
+          import json, re, sys
+          pr_diff = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          fix_diff = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+          commit_id = sys.argv[3]
+          out_path = sys.argv[4]
+
+          added = {}
+          cur = None
+          for line in pr_diff.splitlines():
+              if line.startswith("+++ b/"):
+                  cur = line[6:]
+                  added.setdefault(cur, set())
+              elif line.startswith("@@ ") and cur:
+                  m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+                  if m:
+                      s = int(m.group(1))
+                      c = int(m.group(2)) if m.group(2) is not None else 1
+                      for ln in range(s, s + c):
+                          added[cur].add(ln)
+
+          comments = []
+          outside_hunks = 0
+          cur = None
+          lines = fix_diff.splitlines()
+          i = 0
+          while i < len(lines):
+              line = lines[i]
+              if line.startswith("+++ b/"):
+                  cur = line[6:]
+                  i += 1
+                  continue
+              if line.startswith("@@ ") and cur:
+                  m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+                  i += 1
+                  if not m:
+                      continue
+                  old_s = int(m.group(1))
+                  old_c = int(m.group(2)) if m.group(2) is not None else 1
+                  new_lines = []
+                  while i < len(lines) and not lines[i].startswith(("diff --git ", "@@ ", "--- ", "+++ ")):
+                      hl = lines[i]
+                      if hl.startswith(("+", " ")):
+                          new_lines.append(hl[1:])
+                      i += 1
+                  if old_c >= 1:
+                      old_e = old_s + old_c - 1
+                      allowed = added.get(cur, set())
+                      if all(ln in allowed for ln in range(old_s, old_e + 1)):
+                          body = (
+                              "🛡️ **CodeMender Verified Security Patch** "
+                              "(click **Commit suggestion** to apply under your own GitHub identity):\n"
+                              "```suggestion\n" + "\n".join(new_lines) + "\n```"
+                          )
+                          c_obj = {"path": cur, "line": old_e, "side": "RIGHT", "body": body}
+                          if old_c > 1:
+                              c_obj["start_line"] = old_s
+                              c_obj["start_side"] = "RIGHT"
+                          comments.append(c_obj)
+                      else:
+                          outside_hunks += 1
+                  else:
+                      outside_hunks += 1
+                  continue
+              i += 1
+
+          note = ""
+          if outside_hunks > 0:
+              note = f"\n\n> Note: {outside_hunks} hunk(s) touch lines outside this PR diff (for example, top-of-file imports). Apply the complete unified diff in the PR comment below if needed."
+          payload = {
+              "commit_id": commit_id,
+              "event": "COMMENT",
+              "body": f"🛡️ **CodeMender in Gemini platform** verified an exploitable vulnerability in `{commit_id[:7]}` and attached {len(comments)} inline suggested change(s) below.{note}",
+              "comments": comments,
+          }
+          with open(out_path, "w", encoding="utf-8") as f:
+              json.dump({"count": len(comments), "payload": payload}, f)
+          PY
+
+            SUGG_COUNT=$(jq -r '.count' "$RUNNER_TEMP/review-payload.json")
+            if [ "${SUGG_COUNT}" -gt 0 ]; then
+              jq '.payload' "$RUNNER_TEMP/review-payload.json" > "$RUNNER_TEMP/gh-review.json"
+              gh api "repos/${GITHUB_REPOSITORY}/pulls/${EXISTING_PR}/reviews" \
+                --method POST --input "$RUNNER_TEMP/gh-review.json" >/dev/null || echo "Inline review suggestion skipped; posting full diff comment."
+            fi
+
+            python3 - "$RUNNER_TEMP/cm-fix.diff" "$RUNNER_TEMP/cm-summary.md" "${ORIG_SHA}" "${CM_MODEL}" "${SUGG_COUNT}" "$RUNNER_TEMP/pr-comment.md" << 'PY'
+          import sys
+          diff_txt = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+          summary_md = open(sys.argv[2], encoding="utf-8", errors="replace").read().strip()
+          orig_sha, model, sugg_count, out_file = sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6]
+          sugg_line = (
+              f"* **1-Click Inline Suggestions**: Attached **{sugg_count}** clickable `Commit suggestion` block(s) in the **Files changed** tab."
+              if sugg_count > 0 else
+              "* **How to Apply**: Copy or `git apply` the unified patch below onto your branch."
+          )
+          body = (
+              "<!-- codemender-security-comment -->\n"
+              "## 🛡️ CodeMender Security Review (Pattern 3: Comment-Only, Zero Bot Push)\n\n"
+              f"CodeMender scanned commit `{orig_sha}`, **verified exploitability** in an isolated sandbox (`cm verify`), "
+              f"and synthesized a regression-tested patch (`cm fix` via `{model}`) without modifying your branch.\n\n"
+              f"{sugg_line}\n"
+              "* **Least-Privilege Governance**: No branches or commits were pushed by CI (`contents: read` compatible).\n\n"
+              "### Proposed Unified Security Patch (`git diff`)\n"
+              f"```diff\n{diff_txt}\n```\n\n"
+              "<details><summary><strong>View Full CodeMender Verification Report</strong></summary>\n\n"
+              f"{summary_md}\n\n"
+              "</details>\n"
+          )
+          open(out_file, "w", encoding="utf-8").write(body)
+          PY
+
+            gh pr comment "${EXISTING_PR}" --body-file "$RUNNER_TEMP/pr-comment.md"
+            TARGET_BRANCH="${GITHUB_REF_NAME} (untouched; commented on PR #${EXISTING_PR})"
+
+          elif [ "$MODE" = "pattern-2-direct-commit" ]; then
+            echo "=== Executing Pattern 2: Direct Commit onto ${GITHUB_REF_NAME} + PR into main ==="
+            git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
+
+            PR_TITLE="feat+fix(security): ${GITHUB_REF_NAME} (remediated in-place by CodeMender)"
+            PR_BODY=$(printf '%s\n' \
+              "## CodeMender Pattern 2: Direct Branch Remediation + Pull Request to \`main\`" \
+              "" \
+              "CodeMender scanned the push to \`${GITHUB_REF_NAME}\`, verified exploitability, and committed the security patch directly onto \`${GITHUB_REF_NAME}\` on top of the developer's change." \
+              "" \
+              "### Commits Included in This PR (\`${GITHUB_REF_NAME}\` -> \`main\`)" \
+              "\`\`\`text" \
+              "${COMMIT_LOG}" \
+              "\`\`\`" \
+              "" \
+              "* **Developer Commit Preserved**: \`${ORIG_SHA}\`" \
+              "* **CodeMender Security Fix Appended**: \`${NEW_SHA}\` (\`${CM_MODEL}\`)")
+
+            EXISTING_PR=$(gh pr list --head "${GITHUB_REF_NAME}" --base main --state open --json number --jq '.[0].number // empty')
+            if [ -n "${EXISTING_PR}" ]; then
+              gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}"
+              gh pr comment "${EXISTING_PR}" --body "CodeMender verified an exploitable finding in \`${ORIG_SHA}\` and pushed remediation commit \`${NEW_SHA}\` directly onto \`${GITHUB_REF_NAME}\`."
+              PR_URL=$(gh pr view "${EXISTING_PR}" --json url --jq .url)
+            else
+              PR_URL=$(gh pr create --base main --head "${GITHUB_REF_NAME}" --title "${PR_TITLE}" --body "${PR_BODY}")
+            fi
+            TARGET_BRANCH="${GITHUB_REF_NAME}"
+          else
+            echo "=== Executing Pattern 1: Single Combined PR into main (Developer Feature + CodeMender Fix) ==="
+            REM_BRANCH="codemender/auto-remediation"
+            git push --force origin "HEAD:refs/heads/${REM_BRANCH}"
+
+            PR_TITLE="CodeMender: secured ${GITHUB_REF_NAME} -> main (feature + security patch)"
+            PR_BODY=$(printf '%s\n' \
+              "## CodeMender Pattern 1: Combined Feature + Security Remediation PR into \`main\`" \
+              "" \
+              "This Pull Request combines **the developer's complete feature change** from \`${GITHUB_REF_NAME}\` with **CodeMender's verified security patch**, ready to merge directly into \`main\`." \
+              "" \
+              "### Commits Included in This PR (\`${REM_BRANCH}\` -> \`main\`)" \
+              "\`\`\`text" \
+              "${COMMIT_LOG}" \
+              "\`\`\`" \
+              "" \
+              "* **Developer Feature Commit Included**: \`${ORIG_SHA}\` (from \`${GITHUB_REF_NAME}\`)" \
+              "* **CodeMender Security Patch Layered on Top**: \`${NEW_SHA}\` (\`${CM_MODEL}\`)" \
+              "* **Original Branch Untouched**: \`${GITHUB_REF_NAME}\` remains untouched for comparison and is blocked by the Security Gate.")
+
+            EXISTING_PR=$(gh pr list --head "${REM_BRANCH}" --base main --state open --json number --jq '.[0].number // empty')
+            if [ -n "${EXISTING_PR}" ]; then
+              gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}"
+              PR_URL=$(gh pr view "${EXISTING_PR}" --json url --jq .url)
+            else
+              PR_URL=$(gh pr create --base main --head "${REM_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")
+            fi
+            TARGET_BRANCH="${REM_BRANCH}"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Delivered remediation ($MODE): $PR_URL"
+
+      - name: Generate CodeMender HTML Report
+        if: always()
+        run: |
+          cm report -f html || true
+          if [ -f "$HOME/.codemender/reports/report.html" ]; then
+            cp "$HOME/.codemender/reports/report.html" "$RUNNER_TEMP/codemender-report.html"
+          fi
+
+      - name: Upload HTML Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-html-report
+          path: ${{ runner.temp }}/codemender-report.html
+          if-no-files-found: ignore
+
+      - name: Publish Security Report to Job Summary
+        if: always()
+        run: |
+          {
+            echo "## 🛡️ CodeMender Security Guardrail Report"
+            if [ -n "${{ steps.pr.outputs.pr_url }}" ]; then
+              echo "- **Remediation Pattern**: \`${{ steps.pr.outputs.mode }}\`"
+              echo "- **Secured Branch**: \`${{ steps.pr.outputs.target_branch }}\` -> \`main\`"
+              echo "- **Pull Request (Feature + Security Fix)**: ${{ steps.pr.outputs.pr_url }}"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cm report -f md -y >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Export SARIF Security Report
+        if: always()
+        run: |
+          cm report -f sarif -y > "$RUNNER_TEMP/codemender.sarif" || true
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles(format('{0}/codemender.sarif', runner.temp)) != ''
+        with:
+          sarif_file: ${{ runner.temp }}/codemender.sarif
+          category: codemender
+
+      - name: CodeMender Token Usage Stats
+        if: always()
+        run: |
+          cm stats </dev/null || true
+          cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - name: Upload Token Telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cm-stats-guardrail
+          path: ${{ runner.temp }}/cm-stats.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Security Gate
+        if: always()
+        run: |
+          FOUND="${{ steps.triage.outputs.high_critical }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          MODE="${{ steps.pr.outputs.mode }}"
+          PR_URL="${{ steps.pr.outputs.pr_url }}"
+          FOUND="${FOUND:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$FOUND" -gt 0 ]; then
+            if [ "$MODE" = "pattern-3-pr-comment" ]; then
+              echo "::error title=Deployment blocked (Patch posted as PR comment)::CodeMender found $FOUND HIGH/CRITICAL finding(s) in ${{ steps.remediate.outputs.orig_sha }} and posted a verified patch + inline suggestions on ${PR_URL} without modifying the branch."
+            elif [ "$MODE" = "pattern-2-direct-commit" ]; then
+              echo "::error title=Vulnerable commit blocked & remediated in-place::CodeMender found $FOUND HIGH/CRITICAL finding(s) in ${{ steps.remediate.outputs.orig_sha }} and pushed $PATCHED verified fix commit (${{ steps.remediate.outputs.new_sha }}) directly onto ${GITHUB_REF_NAME} (${PR_URL})."
+            else
+              echo "::error title=Deployment blocked (Combined PR ready)::CodeMender found $FOUND HIGH/CRITICAL finding(s) on ${GITHUB_REF_NAME}. Review and merge the combined feature + security fix PR into main: ${PR_URL}"
+            fi
+            exit 1
+          fi

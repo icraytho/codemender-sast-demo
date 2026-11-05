@@ -1,0 +1,108 @@
+# Pattern 2: production code drop gate. Runs only when a release tag is pushed
+# (or on demand), and scans exactly what changed since the previous release tag,
+# plus callers and callees two hops out. Routine pushes never trigger it.
+name: CodeMender release gate
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Previous release tag to compare against (for example v2.3.0)
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+
+jobs:
+  release-scan:
+    name: CodeMender release scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find the previous release
+        id: range
+        env:
+          INPUT_BASE: ${{ inputs.base_ref }}
+        run: |
+          if [ -n "${INPUT_BASE:-}" ]; then
+            base="$INPUT_BASE"
+          else
+            base=$(git describe --tags --abbrev=0 --match 'v*.*.*' "${GITHUB_SHA}^" 2>/dev/null || true)
+          fi
+          if [ -z "$base" ]; then
+            echo "No previous release tag; this tag becomes the baseline." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "### Release range: ${base:-none}...${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat "${base:-HEAD}" HEAD | tail -n 1 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: google-github-actions/auth@v3
+        if: ${{ steps.range.outputs.base != '' }}
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        if: ${{ steps.range.outputs.base != '' }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - name: Scan the release delta
+        if: ${{ steps.range.outputs.base != '' }}
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          cm --version
+          cm init
+          status=0
+          cm find . \
+            --diff="$BASE" \
+            --diff-depth=2 \
+            --diff-workers=16 \
+            --fail-on=CRITICAL,HIGH \
+            --format=sarif \
+            --output=release.sarif \
+            --sandbox=false \
+            --yes \
+            --bypass-warning || status=$?
+          cm report --format=md >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('release.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: release.sarif
+          category: codemender-release
+
+      - name: Record token usage
+        if: ${{ !cancelled() && steps.range.outputs.base != '' }}
+        run: cm stats --json --since 6h > "$RUNNER_TEMP/cm-stats.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cm-stats.json"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.range.outputs.base != '' }}
+        with:
+          name: cm-stats-release
+          path: ${{ runner.temp }}/cm-stats.json
+          retention-days: 3
